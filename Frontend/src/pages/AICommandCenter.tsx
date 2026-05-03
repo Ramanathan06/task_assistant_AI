@@ -1,0 +1,816 @@
+import { useState, useRef, useEffect, useCallback } from 'react';
+import { motion } from 'framer-motion';
+import { useMutation, useQuery } from '@tanstack/react-query';
+import {
+  Sparkles,
+  Send,
+  Bot,
+  User,
+  Lightbulb,
+  Wand2,
+  Calendar,
+  CheckSquare,
+  BarChart3,
+  Zap,
+  Clock,
+  Copy,
+  Check,
+  Mic,
+  Image as ImageIcon,
+  Paperclip,
+  MessageCircle,
+  AlertCircle,
+} from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Card, CardContent } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+import { Avatar, AvatarFallback } from '@/components/ui/avatar';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import DashboardLayout from '@/components/layout/DashboardLayout';
+import { aiService } from '@/services/ai.service';
+import { chatService } from '@/services/chat.service';
+import { queryKeys } from '@/hooks/useApi';
+import { getApiErrorMessage } from '@/lib/api-client';
+import { useAuthStore } from '@/store/authStore';
+
+// Message types
+interface Message {
+  id: string;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  timestamp: Date;
+  type?: 'message' | 'checkin_prompt' | 'system';
+  suggestions?: string[];
+  actions?: { label: string; action: string }[];
+  metadata?: Record<string, unknown>;
+}
+
+// Quick actions
+const quickActions = [
+  { icon: CheckSquare, label: 'Create Task', prompt: 'Create a new task for...' },
+  { icon: Calendar, label: 'Schedule Meeting', prompt: 'Schedule a meeting with...' },
+  { icon: BarChart3, label: 'View Analytics', prompt: 'Show me analytics for...' },
+  { icon: Zap, label: 'Automate', prompt: 'Create an automation that...' },
+];
+
+// AI suggestions
+const aiSuggestions = [
+  'Summarize my tasks for today',
+  'What are my top priorities?',
+  'Create a sprint plan for next week',
+  'Analyze team productivity trends',
+  'Suggest tasks to delegate',
+];
+
+// Typing indicator component
+function TypingIndicator() {
+  return (
+    <div className="flex items-center gap-1 px-4 py-2">
+      <motion.div
+        animate={{ scale: [1, 1.2, 1] }}
+        transition={{ duration: 0.6, repeat: Infinity, delay: 0 }}
+        className="w-2 h-2 rounded-full bg-primary"
+      />
+      <motion.div
+        animate={{ scale: [1, 1.2, 1] }}
+        transition={{ duration: 0.6, repeat: Infinity, delay: 0.2 }}
+        className="w-2 h-2 rounded-full bg-primary"
+      />
+      <motion.div
+        animate={{ scale: [1, 1.2, 1] }}
+        transition={{ duration: 0.6, repeat: Infinity, delay: 0.4 }}
+        className="w-2 h-2 rounded-full bg-primary"
+      />
+    </div>
+  );
+}
+
+// Check-in prompt component
+function CheckInPromptBubble({
+  message,
+  onReply,
+}: {
+  message: Message;
+  onReply: (text: string) => void;
+}) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="flex gap-4"
+    >
+      <Avatar className="w-8 h-8 bg-amber-500/10">
+        <AvatarFallback className="text-amber-600">
+          <AlertCircle className="w-4 h-4" />
+        </AvatarFallback>
+      </Avatar>
+
+      <div className="flex-1 max-w-[80%]">
+        <div className="inline-block text-left px-4 py-3 rounded-2xl bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/20 rounded-bl-sm">
+          <p className="text-sm font-medium text-amber-800 dark:text-amber-300 mb-1">Status Check-In</p>
+          <p className="whitespace-pre-wrap">{message.content}</p>
+        </div>
+
+        <div className="flex items-center gap-2 mt-1">
+          <span className="text-xs text-muted-foreground">
+            {message.timestamp.toLocaleTimeString('en-US', {
+              hour: 'numeric',
+              minute: '2-digit',
+            })}
+          </span>
+        </div>
+
+        {/* Quick-reply buttons */}
+        {message.suggestions && message.suggestions.length > 0 && (
+          <div className="flex flex-wrap gap-2 mt-3">
+            {message.suggestions.map((suggestion, index) => (
+              <Button
+                key={index}
+                size="sm"
+                variant={
+                  suggestion.toLowerCase().includes('blocked')
+                    ? 'destructive'
+                    : suggestion.toLowerCase().includes('completed')
+                      ? 'default'
+                      : 'outline'
+                }
+                className="gap-1"
+                onClick={() => onReply(suggestion)}
+              >
+                {suggestion}
+              </Button>
+            ))}
+          </div>
+        )}
+      </div>
+    </motion.div>
+  );
+}
+
+// Message bubble component
+function MessageBubble({ message, onSuggestionClick }: { message: Message; onSuggestionClick?: (text: string) => void }) {
+  const isUser = message.role === 'user';
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(message.content);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      className={`flex gap-4 ${isUser ? 'flex-row-reverse' : ''}`}
+    >
+      {/* Avatar */}
+      <Avatar className={`w-8 h-8 ${isUser ? 'bg-primary' : 'bg-primary/10'}`}>
+        <AvatarFallback className={isUser ? 'text-primary-foreground' : 'text-primary'}>
+          {isUser ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
+        </AvatarFallback>
+      </Avatar>
+
+      {/* Content */}
+      <div className={`flex-1 max-w-[80%] ${isUser ? 'text-right' : ''}`}>
+        <div
+          className={`inline-block text-left px-4 py-3 rounded-2xl ${
+            isUser
+              ? 'bg-primary text-primary-foreground rounded-br-sm'
+              : 'bg-muted rounded-bl-sm'
+          }`}
+        >
+          <p className="whitespace-pre-wrap">{message.content}</p>
+        </div>
+
+        {/* Timestamp & Actions */}
+        <div className={`flex items-center gap-2 mt-1 ${isUser ? 'justify-end' : ''}`}>
+          <span className="text-xs text-muted-foreground">
+            {message.timestamp.toLocaleTimeString('en-US', { 
+              hour: 'numeric', 
+              minute: '2-digit' 
+            })}
+          </span>
+          {!isUser && (
+            <button
+              onClick={handleCopy}
+              className="text-muted-foreground hover:text-foreground transition-colors"
+            >
+              {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+            </button>
+          )}
+        </div>
+
+        {/* Suggestions */}
+        {message.suggestions && (
+          <div className="flex flex-wrap gap-2 mt-3">
+            {message.suggestions.map((suggestion, index) => (
+              <Badge
+                key={index}
+                variant="secondary"
+                className="cursor-pointer hover:bg-primary/20 transition-colors"
+                onClick={() => onSuggestionClick?.(suggestion)}
+              >
+                <Lightbulb className="w-3 h-3 mr-1" />
+                {suggestion}
+              </Badge>
+            ))}
+          </div>
+        )}
+
+        {/* Actions */}
+        {message.actions && (
+          <div className="flex flex-wrap gap-2 mt-3">
+            {message.actions.map((action, index) => (
+              <Button key={index} size="sm" variant="outline">
+                {action.label}
+              </Button>
+            ))}
+          </div>
+        )}
+      </div>
+    </motion.div>
+  );
+}
+
+export default function AICommandCenter() {
+  const { user } = useAuthStore();
+  const [messages, setMessages] = useState<Message[]>([
+    {
+      id: 'welcome',
+      role: 'assistant',
+      content: "Hello! I'm your AI assistant. I can help you manage tasks, analyze data, automate workflows, and much more. What would you like to do today?",
+      timestamp: new Date(),
+      suggestions: aiSuggestions.slice(0, 3),
+    },
+  ]);
+  const [inputValue, setInputValue] = useState('');
+  const [isTyping, setIsTyping] = useState(false);
+  const [conversationId, setConversationId] = useState<string | null>(() => {
+    return sessionStorage.getItem('ai_conversation_id');
+  });
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const conversationLoaded = useRef(false);
+
+  // Persist conversationId to sessionStorage
+  useEffect(() => {
+    if (conversationId) {
+      sessionStorage.setItem('ai_conversation_id', conversationId);
+    } else {
+      sessionStorage.removeItem('ai_conversation_id');
+    }
+  }, [conversationId]);
+
+  // Fetch conversation history
+  const { data: conversations, refetch: refetchConversations } = useQuery({
+    queryKey: queryKeys.chat.conversations,
+    queryFn: () => chatService.listConversations({ limit: 20 }),
+  });
+
+  // Auto-reload last conversation on mount
+  useEffect(() => {
+    if (conversationLoaded.current) return;
+    const savedId = conversationId;
+    if (savedId) {
+      conversationLoaded.current = true;
+      chatService.getConversation(savedId).then((conv) => {
+        const loaded: Message[] = (conv.messages ?? []).map((m: { role: string; content: string; timestamp: string }, i: number) => ({
+          id: `${savedId}-${i}`,
+          role: (m.role === 'agent' ? 'assistant' : m.role) as 'user' | 'assistant',
+          content: m.content,
+          timestamp: new Date(m.timestamp),
+        }));
+        if (loaded.length > 0) {
+          setMessages(loaded);
+        }
+      }).catch(() => {
+        // Conversation no longer exists (backend restart), clear it
+        setConversationId(null);
+        sessionStorage.removeItem('ai_conversation_id');
+      });
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auto-scroll to bottom
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages]);
+
+  // WebSocket connection for proactive messages (check-in prompts, notifications)
+  useEffect(() => {
+    if (!user?.id) return;
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/api/v1/chat/ws`;
+
+    let ws: WebSocket;
+    let reconnectTimeout: ReturnType<typeof setTimeout>;
+
+    const connect = () => {
+      ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        // Send auth message
+        ws.send(JSON.stringify({ user_id: user.id, conversation_id: conversationId }));
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+
+          if (data.type === 'checkin_prompt') {
+            const checkinMessage: Message = {
+              id: `checkin-${Date.now()}`,
+              role: 'system',
+              content: data.content,
+              timestamp: new Date(data.timestamp || Date.now()),
+              type: 'checkin_prompt',
+              suggestions: data.suggestions || [
+                "I'm on track",
+                "I'm slightly behind",
+                "I'm blocked - need help",
+                "I completed it",
+              ],
+              metadata: data.metadata,
+            };
+            setMessages((prev) => [...prev, checkinMessage]);
+          } else if (data.type === 'system') {
+            const sysMessage: Message = {
+              id: `sys-${Date.now()}`,
+              role: 'assistant',
+              content: data.content,
+              timestamp: new Date(data.timestamp || Date.now()),
+              type: 'system',
+              suggestions: data.suggestions,
+              metadata: data.metadata,
+            };
+            setMessages((prev) => [...prev, sysMessage]);
+          }
+        } catch {
+          // ignore parse errors
+        }
+      };
+
+      ws.onclose = () => {
+        wsRef.current = null;
+        // Reconnect after 5 seconds
+        reconnectTimeout = setTimeout(connect, 5000);
+      };
+
+      ws.onerror = () => {
+        ws.close();
+      };
+    };
+
+    connect();
+
+    return () => {
+      clearTimeout(reconnectTimeout);
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    };
+  }, [user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Send a message programmatically (from buttons, suggestions, etc.)
+  const sendMessageFromUI = useCallback((text: string) => {
+    if (!text.trim()) return;
+
+    const userMessage: Message = {
+      id: Date.now().toString(),
+      role: 'user',
+      content: text,
+      timestamp: new Date(),
+    };
+
+    setMessages((prev) => [...prev, userMessage]);
+    setInputValue('');
+    setIsTyping(true);
+
+    chatService
+      .sendMessage({ message: text, conversation_id: conversationId ?? undefined })
+      .then((data) => {
+        if (data.conversation_id) setConversationId(data.conversation_id);
+        const aiMessage: Message = {
+          id: data.conversation_id || (Date.now() + 1).toString(),
+          role: 'assistant',
+          content: data.message.content,
+          timestamp: new Date(),
+          suggestions: data.suggestions?.slice(0, 3),
+          actions: data.actions?.map((a) => ({ label: a.label, action: a.action })),
+        };
+        setMessages((prev) => [...prev, aiMessage]);
+        setIsTyping(false);
+        refetchConversations();
+      })
+      .catch(() => {
+        aiService.unblock({ query: text }).then((data) => {
+          const aiMessage: Message = {
+            id: data.session_id || (Date.now() + 1).toString(),
+            role: 'assistant',
+            content: data.suggestion,
+            timestamp: new Date(),
+            suggestions: data.related_docs?.length ? data.related_docs.slice(0, 3) : [],
+            actions: data.escalation_recommended
+              ? [{ label: 'Escalate to team', action: 'escalate' }]
+              : [],
+          };
+          setMessages((prev) => [...prev, aiMessage]);
+          setIsTyping(false);
+        }).catch((err) => {
+          const aiMessage: Message = {
+            id: (Date.now() + 1).toString(),
+            role: 'assistant',
+            content: `Sorry, I encountered an error: ${getApiErrorMessage(err)}. Please try again.`,
+            timestamp: new Date(),
+          };
+          setMessages((prev) => [...prev, aiMessage]);
+          setIsTyping(false);
+        });
+      });
+  }, [conversationId, refetchConversations]);
+
+  // Handle file upload (Paperclip or from TasksPage navigation)
+  const handleFileUpload = useCallback(async (file: File, message?: string) => {
+    const userMessage: Message = {
+      id: Date.now().toString(),
+      role: 'user',
+      content: message || `[Uploaded file: ${file.name}]`,
+      timestamp: new Date(),
+    };
+    setMessages((prev) => [...prev, userMessage]);
+    setIsTyping(true);
+
+    try {
+      const data = await chatService.sendMessageWithFile(file, message, conversationId ?? undefined);
+      if (data.conversation_id) setConversationId(data.conversation_id);
+      const aiMessage: Message = {
+        id: data.conversation_id || (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: data.message.content,
+        timestamp: new Date(),
+        suggestions: data.suggestions?.slice(0, 3),
+        actions: data.actions?.map((a) => ({ label: a.label, action: a.action })),
+      };
+      setMessages((prev) => [...prev, aiMessage]);
+      refetchConversations();
+    } catch (err) {
+      const aiMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: `Sorry, I couldn't process the file: ${getApiErrorMessage(err)}`,
+        timestamp: new Date(),
+      };
+      setMessages((prev) => [...prev, aiMessage]);
+    } finally {
+      setIsTyping(false);
+    }
+  }, [conversationId, refetchConversations]);
+
+  const chatMutation = useMutation({
+    mutationFn: (message: string) =>
+      chatService.sendMessage({
+        message,
+        conversation_id: conversationId ?? undefined,
+      }),
+    onSuccess: (data) => {
+      if (data.conversation_id) {
+        setConversationId(data.conversation_id);
+      }
+      const aiMessage: Message = {
+        id: data.conversation_id || (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: data.message.content,
+        timestamp: new Date(),
+        suggestions: data.suggestions?.slice(0, 3),
+        actions: data.actions?.map((a) => ({ label: a.label, action: a.action })),
+      };
+      setMessages((prev) => [...prev, aiMessage]);
+      setIsTyping(false);
+      refetchConversations();
+    },
+    onError: () => {
+      // Fall back to unblock API
+      unblockFallback.mutate(inputValue);
+    },
+  });
+
+  const unblockFallback = useMutation({
+    mutationFn: (query: string) => aiService.unblock({ query }),
+    onSuccess: (data) => {
+      const aiMessage: Message = {
+        id: data.session_id || (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: data.suggestion,
+        timestamp: new Date(),
+        suggestions: data.related_docs?.length ? data.related_docs.slice(0, 3) : [],
+        actions: data.escalation_recommended
+          ? [{ label: 'Escalate to team', action: 'escalate' }]
+          : [],
+      };
+      setMessages((prev) => [...prev, aiMessage]);
+      setIsTyping(false);
+    },
+    onError: (err) => {
+      const aiMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: `Sorry, I encountered an error: ${getApiErrorMessage(err)}. Please try again.`,
+        timestamp: new Date(),
+      };
+      setMessages((prev) => [...prev, aiMessage]);
+      setIsTyping(false);
+    },
+  });
+
+  const loadConversation = async (convId: string) => {
+    try {
+      const conv = await chatService.getConversation(convId);
+      setConversationId(convId);
+      const loaded: Message[] = (conv.messages ?? []).map((m, i) => ({
+        id: `${convId}-${i}`,
+        role: m.role as 'user' | 'assistant',
+        content: m.content,
+        timestamp: new Date(m.timestamp),
+      }));
+      if (loaded.length > 0) {
+        setMessages(loaded);
+      }
+    } catch {
+      // ignore - conversation may have been deleted
+    }
+  };
+
+  const handleSend = async () => {
+    if (!inputValue.trim()) return;
+
+    const userMessage: Message = {
+      id: Date.now().toString(),
+      role: 'user',
+      content: inputValue,
+      timestamp: new Date(),
+    };
+
+    setMessages((prev) => [...prev, userMessage]);
+    const query = inputValue;
+    setInputValue('');
+    setIsTyping(true);
+
+    chatMutation.mutate(query);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  const handleQuickAction = (prompt: string) => {
+    setInputValue(prompt);
+  };
+
+  const handleSuggestion = (suggestion: string) => {
+    sendMessageFromUI(suggestion);
+  };
+
+  return (
+    <DashboardLayout>
+      <div className="h-[calc(100vh-8rem)] flex flex-col">
+        {/* Header */}
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary to-accent-primary flex items-center justify-center">
+              <Bot className="w-5 h-5 text-white" />
+            </div>
+            <div>
+              <h1 className="text-xl font-bold">AI Command Center</h1>
+              <p className="text-sm text-muted-foreground">Powered by TaskPulse AI</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <Badge variant="secondary" className="gap-1">
+              <Sparkles className="w-3 h-3" />
+              TaskPulse AI
+            </Badge>
+          </div>
+        </div>
+
+        {/* Main Chat Area */}
+        <div className="flex-1 flex gap-6 min-h-0">
+          {/* Chat */}
+          <Card className="flex-1 flex flex-col">
+            {/* Messages */}
+            <ScrollArea ref={scrollRef} className="flex-1 p-4">
+              <div className="space-y-6">
+                {messages.map((message) =>
+                  message.type === 'checkin_prompt' ? (
+                    <CheckInPromptBubble
+                      key={message.id}
+                      message={message}
+                      onReply={sendMessageFromUI}
+                    />
+                  ) : (
+                    <MessageBubble
+                      key={message.id}
+                      message={message}
+                      onSuggestionClick={handleSuggestion}
+                    />
+                  )
+                )}
+                {isTyping && (
+                  <div className="flex gap-4">
+                    <Avatar className="w-8 h-8 bg-primary/10">
+                      <AvatarFallback className="text-primary">
+                        <Bot className="w-4 h-4" />
+                      </AvatarFallback>
+                    </Avatar>
+                    <TypingIndicator />
+                  </div>
+                )}
+              </div>
+            </ScrollArea>
+
+            {/* Input Area */}
+            <div className="p-4 border-t border-border/50">
+              {/* Quick Actions */}
+              <div className="flex gap-2 mb-3 overflow-x-auto pb-2">
+                {quickActions.map((action, index) => {
+                  const Icon = action.icon;
+                  return (
+                    <Button
+                      key={index}
+                      variant="outline"
+                      size="sm"
+                      className="gap-2 flex-shrink-0"
+                      onClick={() => handleQuickAction(action.prompt)}
+                    >
+                      <Icon className="w-4 h-4" />
+                      {action.label}
+                    </Button>
+                  );
+                })}
+              </div>
+
+              {/* Input */}
+              <div className="flex gap-2">
+                <div className="flex-1 relative">
+                  <Input
+                    placeholder="Ask me anything..."
+                    value={inputValue}
+                    onChange={(e) => setInputValue(e.target.value)}
+                    onKeyDown={handleKeyDown}
+                    className="pr-24"
+                  />
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".pdf,.docx,.txt,.md"
+                    className="hidden"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) {
+                        handleFileUpload(file, inputValue || undefined);
+                        setInputValue('');
+                      }
+                      e.target.value = '';
+                    }}
+                  />
+                  <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8"
+                      onClick={() => fileInputRef.current?.click()}
+                      title="Attach file (PDF, DOCX, TXT, MD)"
+                    >
+                      <Paperclip className="w-4 h-4" />
+                    </Button>
+                    <Button variant="ghost" size="icon" className="h-8 w-8">
+                      <ImageIcon className="w-4 h-4" />
+                    </Button>
+                    <Button variant="ghost" size="icon" className="h-8 w-8">
+                      <Mic className="w-4 h-4" />
+                    </Button>
+                  </div>
+                </div>
+                <Button onClick={handleSend} disabled={!inputValue.trim() || isTyping}>
+                  <Send className="w-4 h-4" />
+                </Button>
+              </div>
+            </div>
+          </Card>
+
+          {/* Sidebar */}
+          <div className="hidden xl:block w-80 space-y-4">
+            {/* AI Capabilities */}
+            <Card>
+              <CardContent className="p-4">
+                <h3 className="font-medium mb-3 flex items-center gap-2">
+                  <Wand2 className="w-4 h-4 text-primary" />
+                  AI Capabilities
+                </h3>
+                <div className="space-y-2">
+                  {[
+                    { icon: CheckSquare, label: 'Create & manage tasks' },
+                    { icon: Calendar, label: 'Schedule & plan' },
+                    { icon: BarChart3, label: 'Analyze & report' },
+                    { icon: Zap, label: 'Build automations' },
+                    { icon: Clock, label: 'Time tracking' },
+                  ].map((cap, index) => {
+                    const Icon = cap.icon;
+                    return (
+                      <div key={index} className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <Icon className="w-4 h-4" />
+                        {cap.label}
+                      </div>
+                    );
+                  })}
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Suggestions */}
+            <Card>
+              <CardContent className="p-4">
+                <h3 className="font-medium mb-3 flex items-center gap-2">
+                  <Lightbulb className="w-4 h-4 text-amber-500" />
+                  Try Asking
+                </h3>
+                <div className="space-y-2">
+                  {aiSuggestions.map((suggestion, index) => (
+                    <button
+                      key={index}
+                      onClick={() => handleSuggestion(suggestion)}
+                      className="w-full text-left text-sm text-muted-foreground hover:text-foreground hover:bg-muted p-2 rounded-lg transition-colors"
+                    >
+                      {suggestion}
+                    </button>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Conversation History */}
+            <Card>
+              <CardContent className="p-4">
+                <h3 className="font-medium mb-3 flex items-center gap-2">
+                  <MessageCircle className="w-4 h-4 text-primary" />
+                  Conversations
+                </h3>
+                <div className="space-y-2">
+                  {conversations && conversations.length > 0 ? (
+                    conversations.slice(0, 10).map((conv) => (
+                      <button
+                        key={conv.id}
+                        onClick={() => loadConversation(conv.id)}
+                        className={`w-full text-left text-sm p-2 rounded-lg transition-colors ${
+                          conversationId === conv.id
+                            ? 'bg-primary/10 text-primary'
+                            : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                        }`}
+                      >
+                        <div className="truncate">{conv.title ?? 'Conversation'}</div>
+                        <div className="text-xs text-muted-foreground mt-0.5">
+                          {new Date(conv.last_message_at ?? conv.started_at).toLocaleDateString()}
+                        </div>
+                      </button>
+                    ))
+                  ) : (
+                    <p className="text-sm text-muted-foreground text-center py-2">No conversations yet</p>
+                  )}
+                </div>
+                {conversationId && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="w-full mt-3 gap-2"
+                    onClick={() => {
+                      setConversationId(null);
+                      setMessages([{
+                        id: 'welcome',
+                        role: 'assistant',
+                        content: "Hello! I'm your AI assistant. What would you like to do?",
+                        timestamp: new Date(),
+                        suggestions: aiSuggestions.slice(0, 3),
+                      }]);
+                    }}
+                  >
+                    New Conversation
+                  </Button>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      </div>
+    </DashboardLayout>
+  );
+}

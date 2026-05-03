@@ -1,0 +1,603 @@
+"""
+Chat API Endpoints
+
+Real-time chat and conversation management with AI agents.
+"""
+
+import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ...database import get_db
+from ..v1.dependencies import get_current_active_user
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/chat", tags=["Chat"])
+
+
+# ============== Schemas ==============
+
+class MessageRequest(BaseModel):
+    """Send a message to the chat agent"""
+    message: str = Field(..., min_length=1, max_length=4000)
+    conversation_id: Optional[str] = None
+    agent_name: Optional[str] = None
+    context: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ChatMessage(BaseModel):
+    """A single chat message matching frontend ApiChatMessage"""
+    role: str  # 'user' | 'assistant' | 'system'
+    content: str
+    timestamp: str
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class ChatAction(BaseModel):
+    """An action suggestion"""
+    label: str
+    action: str
+    data: Optional[Dict[str, Any]] = None
+
+
+class MessageResponse(BaseModel):
+    """Response from chat agent - matches frontend ApiChatMessageResponse"""
+    conversation_id: str
+    message: ChatMessage
+    suggestions: List[str] = []
+    actions: List[ChatAction] = []
+
+
+class ConversationInfo(BaseModel):
+    """Conversation summary"""
+    id: str
+    title: Optional[str] = None
+    agent_name: str
+    message_count: int
+    is_active: bool
+    started_at: datetime
+    last_message_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ConversationDetail(BaseModel):
+    """Full conversation with messages"""
+    id: str
+    title: Optional[str] = None
+    agent_name: str
+    messages: List[Dict[str, Any]]
+    context_data: Dict[str, Any] = Field(default_factory=dict)
+    started_at: datetime
+    last_message_at: datetime
+
+
+
+# ============== In-Memory Storage (for demo) ==============
+
+# In production, use database
+_conversations: Dict[str, Dict[str, Any]] = {}
+_active_connections: Dict[str, List[WebSocket]] = {}
+
+
+# ============== Endpoints ==============
+
+@router.post("", response_model=MessageResponse)
+async def send_message(
+    request: MessageRequest,
+    current_user = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Send a message to the chat agent.
+
+    If conversation_id is not provided, a new conversation is started.
+    """
+    from ...agents.orchestrator import get_orchestrator
+
+    orchestrator = get_orchestrator()
+    user_id = current_user.id
+
+    # Get or create conversation
+    conversation_id = request.conversation_id or str(uuid4())
+
+    if conversation_id not in _conversations:
+        _conversations[conversation_id] = {
+            "id": conversation_id,
+            "user_id": user_id,
+            "agent_name": "chat_agent",
+            "messages": [],
+            "context_data": {},
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "last_message_at": datetime.now(timezone.utc).isoformat(),
+            "is_active": True,
+        }
+
+    conversation = _conversations[conversation_id]
+
+    # Add user message
+    user_message = {
+        "id": str(uuid4()),
+        "role": "user",
+        "content": request.message,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    conversation["messages"].append(user_message)
+
+    # Get agent response
+    try:
+        result = await orchestrator.chat(
+            message=request.message,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            db=db,
+        )
+
+        # Add agent response to conversation
+        now = datetime.now(timezone.utc).isoformat()
+        response_text = result.message or "I'm here to help! Try asking about your tasks, or describe a task you'd like to create."
+        agent_message = {
+            "id": str(uuid4()),
+            "role": "assistant",
+            "content": response_text,
+            "agent_name": result.agent_name,
+            "timestamp": now,
+            "metadata": result.output,
+        }
+        conversation["messages"].append(agent_message)
+        conversation["last_message_at"] = now
+
+        # Extract suggestions from output
+        suggestions = result.output.get("suggestions", [])
+
+        # Build actions list
+        actions = [
+            ChatAction(label=a.get("label", ""), action=a.get("action", ""), data=a.get("data"))
+            for a in (result.actions or [])
+        ]
+
+        return MessageResponse(
+            conversation_id=conversation_id,
+            message=ChatMessage(
+                role="assistant",
+                content=response_text,
+                timestamp=now,
+                metadata=result.output,
+            ),
+            suggestions=suggestions,
+            actions=actions,
+        )
+
+    except Exception as e:
+        # Fallback response on error
+        now = datetime.now(timezone.utc).isoformat()
+        error_msg = {
+            "id": str(uuid4()),
+            "role": "assistant",
+            "content": "I'm having trouble processing that. Could you try again?",
+            "agent_name": "chat_agent",
+            "timestamp": now,
+        }
+        conversation["messages"].append(error_msg)
+
+        return MessageResponse(
+            conversation_id=conversation_id,
+            message=ChatMessage(
+                role="assistant",
+                content=error_msg["content"],
+                timestamp=now,
+                metadata={"error": "processing_error"},
+            ),
+            suggestions=["Show my tasks", "I need help", "What can you do?"],
+            actions=[],
+        )
+
+
+@router.post("/with-file", response_model=MessageResponse)
+async def send_message_with_file(
+    file: UploadFile = File(...),
+    message: str = Form(default=""),
+    conversation_id: Optional[str] = Form(default=None),
+    current_user=Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Send a message with an attached file (PDF, DOCX, TXT).
+    The file content is extracted and combined with the message
+    for AI processing (e.g., task creation from a document).
+    """
+    from ...utils.file_extractor import extract_text_from_bytes, is_supported_file
+
+    if not is_supported_file(file.filename or ""):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported file type. Supported: PDF, DOCX, TXT, MD",
+        )
+
+    file_content = await file.read()
+
+    if len(file_content) > 10 * 1024 * 1024:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="File too large. Maximum 10MB.",
+        )
+
+    try:
+        extracted_text = extract_text_from_bytes(file_content, file.filename or "unknown.txt")
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Could not extract text from file: {str(e)}",
+        )
+
+    combined_message = message.strip() if message else ""
+    if combined_message:
+        combined_message += f"\n\n[Attached file: {file.filename}]\n{extracted_text[:4000]}"
+    else:
+        combined_message = (
+            f"I need to create a task based on this document ({file.filename}):\n\n"
+            f"{extracted_text[:4000]}"
+        )
+
+    inner_request = MessageRequest(
+        message=combined_message,
+        conversation_id=conversation_id,
+        context={"file_name": file.filename, "file_extracted": True},
+    )
+
+    return await send_message(inner_request, current_user, db)
+
+
+@router.get("/conversations", response_model=List[ConversationInfo])
+async def list_conversations(
+    is_active: Optional[bool] = Query(None, description="Filter by active status"),
+    limit: int = Query(20, ge=1, le=100),
+    current_user = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    List user's conversations.
+    """
+    user_id = current_user.id
+
+    # Filter conversations for this user
+    user_conversations = [
+        conv for conv in _conversations.values()
+        if conv.get("user_id") == user_id
+    ]
+
+    # Apply active filter
+    if is_active is not None:
+        user_conversations = [
+            conv for conv in user_conversations
+            if conv.get("is_active") == is_active
+        ]
+
+    # Sort by last message
+    user_conversations.sort(
+        key=lambda c: c.get("last_message_at", ""),
+        reverse=True
+    )
+
+    # Apply limit
+    user_conversations = user_conversations[:limit]
+
+    return [
+        ConversationInfo(
+            id=conv["id"],
+            title=conv.get("title") or _generate_title(conv),
+            agent_name=conv.get("agent_name", "chat_agent"),
+            message_count=len(conv.get("messages", [])),
+            is_active=conv.get("is_active", True),
+            started_at=datetime.fromisoformat(conv["started_at"]),
+            last_message_at=datetime.fromisoformat(conv["last_message_at"]),
+        )
+        for conv in user_conversations
+    ]
+
+
+@router.get("/conversations/{conversation_id}", response_model=ConversationDetail)
+async def get_conversation(
+    conversation_id: str,
+    current_user = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get a specific conversation with all messages.
+    """
+    user_id = current_user.id
+
+    conversation = _conversations.get(conversation_id)
+
+    if not conversation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found"
+        )
+
+    if conversation.get("user_id") != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to view this conversation"
+        )
+
+    # Normalize message roles: "agent" → "assistant"
+    messages = []
+    for m in conversation.get("messages", []):
+        msg = dict(m)
+        if msg.get("role") == "agent":
+            msg["role"] = "assistant"
+        messages.append(msg)
+
+    return ConversationDetail(
+        id=conversation["id"],
+        title=conversation.get("title") or _generate_title(conversation),
+        agent_name=conversation.get("agent_name", "chat_agent"),
+        messages=messages,
+        context_data=conversation.get("context_data", {}),
+        started_at=datetime.fromisoformat(conversation["started_at"]),
+        last_message_at=datetime.fromisoformat(conversation["last_message_at"]),
+    )
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str,
+    current_user = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Delete a conversation.
+    """
+    user_id = current_user.id
+
+    conversation = _conversations.get(conversation_id)
+
+    if not conversation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found"
+        )
+
+    if conversation.get("user_id") != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to delete this conversation"
+        )
+
+    del _conversations[conversation_id]
+
+    return {"message": "Conversation deleted", "conversation_id": conversation_id}
+
+
+@router.post("/conversations/{conversation_id}/end")
+async def end_conversation(
+    conversation_id: str,
+    current_user = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    End an active conversation.
+    """
+    user_id = current_user.id
+
+    conversation = _conversations.get(conversation_id)
+
+    if not conversation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found"
+        )
+
+    if conversation.get("user_id") != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to end this conversation"
+        )
+
+    conversation["is_active"] = False
+
+    return {"message": "Conversation ended", "conversation_id": conversation_id}
+
+
+@router.websocket("/ws")
+async def websocket_chat(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time chat.
+
+    SEC-008: Requires JWT token authentication on connect.
+    Clients send an initial message with {"token": "<JWT>", ...}.
+    The token is verified before the connection is established.
+    """
+    await websocket.accept()
+
+    user_id = None
+    conversation_id = None
+
+    try:
+        # SEC-008: Expect initial auth message with JWT token
+        auth_data = await websocket.receive_json()
+        token = auth_data.get("token")
+        conversation_id = auth_data.get("conversation_id") or str(uuid4())
+
+        if not token:
+            await websocket.send_json({"error": "Authentication required. Provide a valid JWT token."})
+            await websocket.close(code=4001)
+            return
+
+        # SEC-008: Verify Supabase JWT and extract user identity
+        from ...core.security import verify_supabase_token
+        payload = verify_supabase_token(token)
+        if not payload:
+            await websocket.send_json({"error": "Invalid or expired token."})
+            await websocket.close(code=4001)
+            return
+
+        user_id = payload.get("sub")
+        if not user_id:
+            await websocket.send_json({"error": "Invalid token payload."})
+            await websocket.close(code=4001)
+            return
+
+        # Track connection
+        if user_id not in _active_connections:
+            _active_connections[user_id] = []
+        _active_connections[user_id].append(websocket)
+
+        # Send confirmation
+        await websocket.send_json({
+            "type": "connected",
+            "conversation_id": conversation_id,
+        })
+
+        # Create conversation if needed
+        if conversation_id not in _conversations:
+            _conversations[conversation_id] = {
+                "id": conversation_id,
+                "user_id": user_id,
+                "agent_name": "chat_agent",
+                "messages": [],
+                "context_data": {},
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "last_message_at": datetime.now(timezone.utc).isoformat(),
+                "is_active": True,
+            }
+
+        # Message loop
+        from ...agents.orchestrator import get_orchestrator
+        orchestrator = get_orchestrator()
+
+        while True:
+            data = await websocket.receive_json()
+            message = data.get("message", "")
+
+            if not message:
+                continue
+
+            # Add user message
+            conversation = _conversations[conversation_id]
+            user_message = {
+                "id": str(uuid4()),
+                "role": "user",
+                "content": message,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            conversation["messages"].append(user_message)
+
+            # Send typing indicator
+            await websocket.send_json({"type": "typing", "agent": "chat_agent"})
+
+            # Get response
+            try:
+                result = await orchestrator.chat(
+                    message=message,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                )
+
+                agent_message = {
+                    "id": str(uuid4()),
+                    "role": "assistant",
+                    "content": result.message,
+                    "agent_name": result.agent_name,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "metadata": result.output,
+                }
+                conversation["messages"].append(agent_message)
+                conversation["last_message_at"] = datetime.now(timezone.utc).isoformat()
+
+                await websocket.send_json({
+                    "type": "message",
+                    "message_id": agent_message["id"],
+                    "content": result.message,
+                    "agent_name": result.agent_name,
+                    "timestamp": agent_message["timestamp"],
+                    "suggestions": result.output.get("suggestions", []),
+                    "actions": result.actions,
+                })
+
+            except Exception as e:
+                logger.error(f"WebSocket chat error for user {user_id}: {str(e)}")
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "I'm having trouble processing that. Please try again.",
+                })
+
+    except WebSocketDisconnect:
+        # Clean up connection
+        if user_id and user_id in _active_connections:
+            _active_connections[user_id] = [
+                ws for ws in _active_connections[user_id]
+                if ws != websocket
+            ]
+            if not _active_connections[user_id]:
+                del _active_connections[user_id]
+
+    except Exception as e:
+        # Handle other errors — do not leak exception details to client
+        logger.error(f"WebSocket connection error for user {user_id}: {str(e)}")
+        try:
+            await websocket.send_json({"type": "error", "message": "Connection error occurred."})
+            await websocket.close()
+        except Exception:
+            pass
+
+
+# ============== Push Helpers ==============
+
+async def push_system_message_to_user(
+    user_id: str,
+    content: str,
+    message_type: str = "system",
+    suggestions: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+):
+    """
+    Push a proactive message to a user's active WebSocket connections.
+    Used by the scheduler for check-in prompts and notifications.
+    """
+    connections = _active_connections.get(user_id, [])
+    if not connections:
+        return
+
+    message = {
+        "type": message_type,
+        "content": content,
+        "suggestions": suggestions or [],
+        "metadata": metadata or {},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    dead_connections = []
+    for ws in connections:
+        try:
+            await ws.send_json(message)
+        except Exception:
+            dead_connections.append(ws)
+
+    # Clean up dead connections
+    for ws in dead_connections:
+        connections.remove(ws)
+    if not connections:
+        _active_connections.pop(user_id, None)
+
+
+# ============== Helper Functions ==============
+
+def _generate_title(conversation: Dict[str, Any]) -> str:
+    """Generate a title from the first message"""
+    messages = conversation.get("messages", [])
+    if not messages:
+        return "New Conversation"
+
+    first_message = messages[0].get("content", "")
+    if len(first_message) > 50:
+        return first_message[:47] + "..."
+    return first_message or "New Conversation"
